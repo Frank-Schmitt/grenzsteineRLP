@@ -83,7 +83,7 @@ def download_osm_tile(zoom, x, y, cache_dir):
 
     url = f"https://tile.openstreetmap.org/{zoom}/{x}/{y}.png"
     headers = {
-        "User-Agent": "GrenzsteinExporter/1.0 (frank.schmitt@gmail.com)"
+        "User-Agent": "GrenzsteinExporter/1.0 (your.email.here@gmail.com)"
     }
 
     response = requests.get(url, headers=headers, timeout=10)
