@@ -96,17 +96,89 @@ def download_osm_tile(zoom, x, y, cache_dir):
     time.sleep(0.5)
 
 
-def prepare_osm_tile_cache(map_points, cache_dir='tile_cache', min_zoom=12, max_zoom=19):
+def tile_bounds_epsg3857(x, y, z):
+    """Berechnet die EPSG:3857 Bounding Box (min_x, min_y, max_x, max_y) für ein OSM-Tile (x, y, z)."""
+    origin_shift = 20037508.342789244
+    map_size = origin_shift * 2.0
+    tile_size = map_size / (2.0 ** z)
+
+    min_x = x * tile_size - origin_shift
+    max_x = (x + 1) * tile_size - origin_shift
+    max_y = origin_shift - y * tile_size
+    min_y = origin_shift - (y + 1) * tile_size
+
+    return min_x, min_y, max_x, max_y
+
+
+def download_wms_tile(zoom, x, y, cache_dir):
+    """Lädt ein WMS-Kachel-PNG für die berechnete Tile-BBOX herunter und speichert es lokal."""
+    tile_path = os.path.join(cache_dir, str(zoom), str(x), f"{y}.png")
+
+    if os.path.exists(tile_path):
+        return
+
+    min_x, min_y, max_x, max_y = tile_bounds_epsg3857(x, y, zoom)
+
+    url = "https://geo5.service24.rlp.de/wms/liegenschaften_rp.fcgi"
+    params = {
+        "SERVICE": "WMS",
+        "VERSION": "1.1.1",
+        "REQUEST": "GetMap",
+        "LAYERS": "Flurstueck,GebaeudeBauwerke",
+        "STYLES": "",
+        "SRS": "EPSG:3857",
+        "BBOX": f"{min_x},{min_y},{max_x},{max_y}",
+        "WIDTH": "256",
+        "HEIGHT": "256",
+        "FORMAT": "image/png",
+        "TRANSPARENT": "TRUE"
+    }
+
+    headers = {
+        "User-Agent": "GrenzsteinExporter/1.0"
+    }
+
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=10)
+        response.raise_for_status()
+
+        os.makedirs(os.path.dirname(tile_path), exist_ok=True)
+        with open(tile_path, mode='wb') as tile_file:
+            tile_file.write(response.content)
+
+        time.sleep(0.2)
+    except Exception as e:
+        print(f"Warnung: WMS-Tile {zoom}/{x}/{y} konnte nicht geladen werden ({e})")
+
+
+def prepare_tile_caches(map_points, html_dir, min_zoom=12, max_zoom=19, buffer_meters=100):
+    """Caching-Funktion für OSM- und ALKIS-WMS-Kacheln inklusive Umkreis-Puffer in Metern."""
     if not map_points:
         return
+
+    osm_cache_dir = os.path.join(html_dir, 'tile_cache')
+    wms_cache_dir = os.path.join(html_dir, 'wms_cache')
 
     latitudes = [point['lat'] for point in map_points]
     longitudes = [point['lon'] for point in map_points]
 
-    lat_min = min(latitudes)
-    lat_max = max(latitudes)
-    lon_min = min(longitudes)
-    lon_max = max(longitudes)
+    lat_min_raw = min(latitudes)
+    lat_max_raw = max(latitudes)
+    lon_min_raw = min(longitudes)
+    lon_max_raw = max(longitudes)
+
+    # 1. 100 Meter Puffer auf Lat/Lon-Grad umrechnen
+    avg_lat = (lat_min_raw + lat_max_raw) / 2.0
+    lat_buffer = buffer_meters / 111000.0  # 1 Grad Breitengrad ≈ 111 km
+    lon_buffer = buffer_meters / (111000.0 * math.cos(math.radians(avg_lat)))  # Breitenkreis-Korrektur
+
+    # 2. Bounding Box mit Puffer erweitern
+    lat_min = lat_min_raw - lat_buffer
+    lat_max = lat_max_raw + lat_buffer
+    lon_min = lon_min_raw - lon_buffer
+    lon_max = lon_max_raw + lon_buffer
+
+    print(f"Starte Caching von OSM- und ALKIS-WMS-Kacheln (inkl. {buffer_meters}m Puffer)...")
 
     for zoom in range(min_zoom, max_zoom + 1):
         x1, y1 = deg2num(lat_max, lon_min, zoom)
@@ -114,10 +186,10 @@ def prepare_osm_tile_cache(map_points, cache_dir='tile_cache', min_zoom=12, max_
 
         for x in range(min(x1, x2), max(x1, x2) + 1):
             for y in range(min(y1, y2), max(y1, y2) + 1):
-                download_osm_tile(zoom, x, y, cache_dir)
+                download_osm_tile(zoom, x, y, osm_cache_dir)
+                download_wms_tile(zoom, x, y, wms_cache_dir)
 
-    print(f"OSM-Tile-Cache vorbereitet in '{cache_dir}'.")
-
+    print(f"Kachel-Caches vollständig vorbereitet im Ordner '{html_dir}'.")
 
 def format_genauigkeitsstufe(code):
     if not code:
@@ -298,93 +370,9 @@ def parse_grenzpunkte(xml_path):
         writer.writerows(grenzpunkte)
 
     html_path = write_map_html(csv_path, map_points)
-    if html_path:
-        prepare_osm_tile_cache(map_points, cache_dir=os.path.join(os.path.dirname(os.path.abspath(html_path)), 'tile_cache'))
 
     print(f"Erfolgreich {len(grenzpunkte)} Grenzsteine exportiert nach: {csv_path}")
     return csv_path, html_path
-
-
-def write_map_html_old(csv_path, map_points):
-    if not map_points:
-        print("Hinweis: Keine Koordinaten für die OSM-Karte verfügbar.")
-        return None
-
-    map_path = os.path.splitext(csv_path)[0] + '_karte.html'
-    html_dir = os.path.dirname(os.path.abspath(map_path))
-    tile_cache_dir = os.path.join(html_dir, 'tile_cache')
-    tile_cache_url = os.path.relpath(tile_cache_dir, html_dir).replace('\\', '/') + '/{z}/{x}/{y}.png'
-    points_json = json.dumps(map_points)
-
-    html = f"""<!DOCTYPE html>
-<html lang=\"de\">
-<head>
-    <meta charset=\"UTF-8\" />
-    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
-    <title>Grenzstein-Karte</title>
-    <link rel=\"stylesheet\" href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\" />
-    <style>
-        html, body {{ height: 100%; margin: 0; font-family: Arial, sans-serif; }}
-        body {{ background: #f3f3f3; }}
-        #map {{ height: 100vh; width: 100%; }}
-        .leaflet-tooltip.label-tooltip {{
-            background: rgba(255, 255, 255, 0.95);
-            border: 1px solid #666;
-            border-radius: 6px;
-            padding: 4px 8px;
-            font-weight: bold;
-            color: #111;
-            box-shadow: 0 0 6px rgba(0,0,0,0.15);
-        }}
-    </style>
-</head>
-<body>
-    <div id=\"map\"></div>
-    <script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"></script>
-    <script>
-        const points = {points_json};
-        const map = L.map('map');
-
-        L.tileLayer('{tile_cache_url}', {{
-            maxZoom: 19,
-            attribution: '&copy; OpenStreetMap contributors'
-        }}).addTo(map);
-
-        const bounds = L.latLngBounds(points.map((point) => [point.lat, point.lon]));
-        map.fitBounds(bounds.pad(0.25));
-
-        points.forEach((point) => {{
-            const marker = L.circleMarker([point.lat, point.lon], {{
-                radius: 6,
-                color: '#d62728',
-                fillColor: '#d62728',
-                fillOpacity: 1,
-                weight: 1
-            }}).addTo(map);
-
-            marker.bindTooltip(String(point.index), {{
-                permanent: true,
-                direction: 'top',
-                className: 'label-tooltip'
-            }});
-
-            marker.bindPopup(
-                '<b>Stein Nr. ' + point.index + '</b><br>' +
-                'Lat: ' + point.lat.toFixed(6) + '<br>' +
-                'Lon: ' + point.lon.toFixed(6) + '<br>' +
-                'Abmarkung: ' + point.abmarkung
-            );
-        }});
-    </script>
-</body>
-</html>
-"""
-
-    with open(map_path, mode='w', encoding='utf-8') as map_file:
-        map_file.write(html)
-
-    print(f"OSM-Karte erzeugt: {map_path}")
-    return map_path
 
 def write_map_html(csv_path, map_points):
     if not map_points:
@@ -393,8 +381,13 @@ def write_map_html(csv_path, map_points):
 
     map_path = os.path.splitext(csv_path)[0] + '_karte.html'
     html_dir = os.path.dirname(os.path.abspath(map_path))
+
     tile_cache_dir = os.path.join(html_dir, 'tile_cache')
+    wms_cache_dir = os.path.join(html_dir, 'wms_cache')
+
     tile_cache_url = os.path.relpath(tile_cache_dir, html_dir).replace('\\', '/') + '/{z}/{x}/{y}.png'
+    wms_cache_url = os.path.relpath(wms_cache_dir, html_dir).replace('\\', '/') + '/{z}/{x}/{y}.png'
+
     points_json = json.dumps(map_points)
 
     html = f"""<!DOCTYPE html>
@@ -432,20 +425,17 @@ def write_map_html(csv_path, map_points):
             attribution: '&copy; OpenStreetMap contributors'
         }}).addTo(map);
 
-        // 2. LVermGeo RLP WMS Overlay: Flurstücke + Gebäude in einem Aufruf
-        const alkisWmsLayer = L.tileLayer.wms('https://geo5.service24.rlp.de/wms/liegenschaften_rp.fcgi', {{
-            layers: 'Flurstueck,GebaeudeBauwerke',
-            format: 'image/png',
-            transparent: true,
+        // 2. ALKIS Flurstücke & Gebäude Overlay (lokal gecacht)
+        const alkisLayer = L.tileLayer('{wms_cache_url}', {{
             maxZoom: 19,
             attribution: '&copy; GeoBasis-DE / LVermGeo RLP'
         }}).addTo(map);
 
-        // Layer-Steuerung oben rechts zum Ein-/Ausblenden
+        // Layer-Steuerung oben rechts
         L.control.layers({{
             "OpenStreetMap": osmLayer
         }}, {{
-            "ALKIS (Flurstücke & Gebäude)": alkisWmsLayer
+            "ALKIS (Flurstücke & Gebäude)": alkisLayer
         }}).addTo(map);
 
         const bounds = L.latLngBounds(points.map((point) => [point.lat, point.lon]));
@@ -482,6 +472,10 @@ def write_map_html(csv_path, map_points):
         map_file.write(html)
 
     print(f"OSM-Karte erzeugt: {map_path}")
+    
+    # Caching ausführen für OSM und WMS
+    prepare_tile_caches(map_points, html_dir)
+
     return map_path
 
 if __name__ == "__main__":
